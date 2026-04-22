@@ -1,76 +1,150 @@
-# RTSP Dual-Camera Streaming and Recording for Jetson NX
+# RTSP Dual-Camera Streaming and Recording — Jetson Orin NX + Desktop
 
-This project provides a complete solution for capturing video from two Basler cameras on a Jetson NX device, streaming the combined video over RTSP, and then receiving, previewing, and recording that stream on a separate desktop machine.
+Stream two Basler cameras from a Jetson Orin NX to a desktop over RTSP,
+with live GUI preview and per-camera MP4 recording.
 
-## Architecture
+---
 
-The system is composed of two main components:
+## System Architecture
 
-1.  **RTSP Server (Jetson Device)**: A Python script that runs on a Jetson Orin NX and uses GStreamer to:
-    *   Capture video from two connected Basler cameras.
-    *   Optionally apply camera settings from `.pfs` configuration files.
-    *   Combine the two camera feeds into a single side-by-side video stream.
-    *   Encode the combined stream in H.264 format.
-    *   Serve the H.264 stream over RTSP.
+```
+┌─────────────────────────────────────────┐        ┌────────────────────────────────────────┐
+│         Jetson Orin NX (server)         │        │         Desktop / ZBOX (client)         │
+│                                         │        │                                        │
+│  Basler cam0 (GRAY8)                    │        │  GStreamer RTSP receive                 │
+│      │                                  │  RTSP  │      │                                 │
+│  Basler cam1 (GRAY8)                    │ ──────▶│  Hardware decode (vah264dec /           │
+│      │                                  │        │   nvh264dec / avdec_h264 fallback)      │
+│  pylonsrc × 2                           │        │      │                                 │
+│  → nvvidconv → textoverlay (datetime)   │        │  cv2.imshow  preview @ 1280px wide     │
+│  → compositor (side-by-side 2×W)        │        │  numpy slice → VideoWriter             │
+│  → nvvidconv → nvv4l2h264enc (NVENC)    │        │      cam0_<ts>.mp4  (left half)         │
+│  → rtph264pay → GstRTSPServer           │        │      cam1_<ts>.mp4  (right half)        │
+└─────────────────────────────────────────┘        └────────────────────────────────────────┘
+```
 
-2.  **RTSP Client (Desktop)**: A Python script that runs on a desktop computer and uses GStreamer to:
-    *   Connect to the RTSP stream from the Jetson device.
-    *   Display a live preview of the video stream.
-    *   Record the stream to an MP4 file, with options for single-file or segmented recording.
+**Key design points:**
+- The Jetson encodes in hardware (NVENC), so the entire camera→network path never bottlenecks on Python.
+- The stream is a single H.264 feed: a side-by-side composite `(2×side_w) × side_h` with a green datetime overlay baked in by the server.
+- The client splits the composite with zero-copy numpy slices for preview; contiguous copies are made only when writing to the VideoWriter.
+- The client auto-detects frame dimensions from the first frame, so `--side_w` / `--side_h` do not need to be passed manually.
+
+---
 
 ## Project Structure
 
 ```
-├── rtsp_client_desktop/
-│   └── rtsp_preview_and_record.py
-└── rtsp_server_jetson_device/
-    ├── camera1_config_gray.pfs
-    └── mini_rtsp_dualcam_pfs.py
+├── rtsp_server_jetson_device/
+│   ├── mini_rtsp_dualcam_pfs.py        # Main RTSP server script
+│   ├── camera1_config_gray.pfs         # Basler PFS config — cam0, grayscale
+│   ├── camera2_config_gray.pfs         # Basler PFS config — cam1, grayscale
+│   ├── camera1_config_color.pfs        # Basler PFS config — cam0, color
+│   ├── camera2_config_color.pfs        # Basler PFS config — cam1, color
+│   └── requirements.txt               # Server-side Python dependencies
+│
+└── rtsp_client_desktop/
+    ├── rtsp_dual_recorder.py           # Main client script (preview + record)
+    ├── pyproject.toml                  # uv project config
+    └── rtsp_preview_and_record.py      # Older single-file client (reference)
 ```
 
-## Usage
+---
 
-### 1. Server (Jetson Device)
+## Quick Start
 
-The server script `mini_rtsp_dualcam_pfs.py` is run on the Jetson device.
+### Server — Jetson Orin NX
 
-**Example command:**
+> **Hardware:** Jetson Orin NX, two Basler cameras via USB/GigE, GStreamer with Jetson multimedia plugins.
 
 ```bash
-python mini_rtsp_dualcam_pfs.py --fps 60 --side_w 1024 --side_h 768 --bitrate 12000000 --pfs0 camera1_config_gray.pfs --force_format "GRAY8"
+cd /home/casper/Dual_Camera
+
+python mini_rtsp_dualcam_pfs.py \
+  --fps 60 \
+  --side_w 1024 --side_h 768 \
+  --pfs0 camera1_config_gray.pfs \
+  --pfs1 camera2_config_gray.pfs \
+  --force_format GRAY8 \
+  --bitrate 12000000
 ```
 
-**Arguments:**
+The server listens on **`rtsp://<jetson_ip>:8554/dualcam`**.
 
-*   `--pfs0`, `--pfs1`: Path to the `.pfs` configuration file for each camera.
-*   `--fps`: Target frames per second for the output stream.
-*   `--side_w`, `--side_h`: Width and height for each camera's video feed after resizing.
-*   `--bitrate`: The H.264 encoding bitrate in bits per second.
-*   `--mount`: The RTSP mount point (e.g., `/dualcam`).
-*   `--port`: The TCP port for the RTSP server.
-*   `--force_format`: Force a specific color format after `pylonsrc` (e.g., `YUY2`, `BGRx`, `GRAY8`).
+**Server arguments:**
 
-### 2. Client (Desktop)
+| Argument | Default | Description |
+|----------|---------|-------------|
+| `--fps` | 30 | Target stream frame rate |
+| `--side_w` | 1024 | Per-camera width (each half of composite) |
+| `--side_h` | 768 | Frame height |
+| `--pfs0` | — | PFS config file for camera 0 (left) |
+| `--pfs1` | — | PFS config file for camera 1 (right) |
+| `--force_format` | — | Force pixel format after pylonsrc (e.g. `GRAY8`, `BGRx`) |
+| `--bitrate` | 8000000 | H.264 encoding bitrate in bps |
+| `--port` | 8554 | RTSP server port |
+| `--mount` | `/dualcam` | RTSP mount point |
 
-The client script `rtsp_preview_and_record.py` is run on a desktop machine to view and record the stream.
+---
 
-**Example command:**
+### Client — Desktop (ZBOX or any Linux machine)
+
+> **Requirements:** Python 3.12, `uv`, system `python3-opencv` with GStreamer support.
+>
+> ```bash
+> sudo apt install python3-opencv   # Ubuntu — provides GStreamer-enabled cv2
+> uv venv --python 3.12 --system-site-packages .venv
+> ```
 
 ```bash
-python rtsp_preview_and_record.py rtsp://<JETSON_IP>:8554/dualcam output.mp4 --segment-seconds 300
+cd rtsp_client_desktop
+
+uv run python rtsp_dual_recorder.py --url rtsp://192.168.0.151:8554/dualcam
 ```
 
-**Arguments:**
+**Client arguments:**
 
-*   `rtsp_url`: The URL of the RTSP stream from the Jetson device.
-*   `output`: The name of the output MP4 file (ignored if using segmentation).
-*   `--latency`: Jitter buffer latency in milliseconds.
-*   `--segment-seconds`: If specified, rotates the output video file every N seconds.
-*   `--hwdec`: Hardware decoding option (`auto`, `nv`, `cpu`).
-*   `--keyword`: A prefix for the output segmented video files.
+| Argument | Default | Description |
+|----------|---------|-------------|
+| `--url` | `rtsp://192.168.0.151:8554/dualcam` | RTSP stream URL |
+| `--side_w` | 1280 | Per-camera width (auto-detected from stream) |
+| `--side_h` | 1024 | Frame height (auto-detected from stream) |
+| `--fps` | 60.0 | Expected stream fps (used by VideoWriter) |
+| `--output_dir` | `./recordings` | Directory for recorded MP4 files |
 
-## Configuration
+**Keyboard controls:**
 
-*   **Camera Configuration**: The server script can use `.pfs` files to configure the Basler cameras. An example `camera1_config_gray.pfs` is provided.
-*   **Stream Parameters**: The resolution, frame rate, and bitrate of the stream can be configured via command-line arguments on the server-side script.
-*   **Recording**: The client script allows for flexible recording options, including continuous recording to a single file or segmented recording.
+| Key | Action |
+|-----|--------|
+| `r` | Start recording |
+| `s` | Stop recording |
+| `q` / ESC | Quit |
+
+Recordings are saved as `cam0_<timestamp>.mp4` and `cam1_<timestamp>.mp4` in `--output_dir`.
+
+---
+
+## Hardware Decoder Selection (client)
+
+The client tries hardware decoders in this order and prints which one was selected at startup:
+
+1. `nvh264dec` — NVIDIA NVDEC (RTX GPU) — best performance
+2. `vah264dec` — Intel/AMD VA-API — good performance
+3. `avdec_h264` — software decode fallback — ~43 fps on 2560×1024
+
+On Ubuntu 24.04 with NVIDIA driver 570+, `nvh264dec` via the apt GStreamer package
+may fail to initialize CUDA despite the driver being present (ABI mismatch). In that
+case `vah264dec` is used automatically and delivers ~60 fps on Intel integrated graphics.
+
+---
+
+## Known Issues & Fixes Applied
+
+### Stream lag and camera freeze (server-side)
+**Symptom:** One camera half freezes; the other accumulates ~1 min of lag.  
+**Cause:** GStreamer compositor blocking on timestamp sync between the two camera branches.  
+**Fix:** `compositor sync=false` + pre-compositor queues capped at `max-size-buffers=2 leaky=downstream`.
+
+### Stripe artifact in recorded files (client-side)
+**Symptom:** Recorded MP4 shows horizontal stripes; GUI preview is fine.  
+**Cause:** `frame[:, :side_w]` is a non-contiguous numpy view; GStreamer `appsrc` reads raw bytes ignoring stride.  
+**Fix:** `.copy()` called on each half before passing to `VideoWriter.write()`.
