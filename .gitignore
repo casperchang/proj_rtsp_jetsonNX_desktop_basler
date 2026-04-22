@@ -1,0 +1,29 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
+
+# uv
+uv.lock
+
+# Recordings / videos
+*.mp4
+*.avi
+
+# Logs & data
+*.csv
+*.log
+
+# Camera feature dumps
+camera_features*.txt
+
+# Temp / message files
+MESSAGE_FOR_SERVER.md
+REPLY_FROM_SERVER.md
+
+# IDE / Claude
+.claude/
+.idea/
+.vscode/

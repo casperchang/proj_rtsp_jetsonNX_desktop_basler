@@ -3,11 +3,13 @@ import gi, argparse, os
 gi.require_version('Gst', '1.0')
 gi.require_version('GstRtspServer', '1.0')
 from gi.repository import Gst, GstRtspServer, GLib
+import datetime
 
 '''
 run this code working on Jetson Orin NX with two Basler cameras
 command example:
     python mini_rtsp_dualcam_pfs.py --fps 60 --side_w 1024 --side_h 768 --bitrate 12000000 --pfs0 camera1_config_gray.pfs --pfs1 camera2_config_gray.pfs --force_format "GRAY8"
+    python mini_rtsp_dualcam_pfs.py --fps 60 --side_w 1200 --side_h 900 --bitrate 12000000 --pfs0 camera1_config_gray.pfs --pfs1 camera2_config_gray.pfs --force_format "GRAY8"
 note:
     camera1_config_gray.pfs has been located in the same folder as this script.
 '''
@@ -22,10 +24,16 @@ def build_cam_branch(idx: int, pfs_path: str, force_fmt: str, w: int, h: int, fp
     return (
         f" pylonsrc device-index={idx} " + pfs_prop +
         f"! video/x-raw,format={force_fmt} ! "               # ★ 關鍵：強制穩定色彩格式
-        " queue leaky=2 max-size-buffers=0 max-size-bytes=0 max-size-time=0 ! "
+        " queue leaky=2 max-size-buffers=2 max-size-bytes=0 max-size-time=0 ! "
         f" nvvidconv ! video/x-raw,format=I420,width={w},height={h},framerate={fps}/1 ! "
-        " queue leaky=2 max-size-buffers=0 max-size-bytes=0 max-size-time=0 ! "
+        f" textoverlay name=ov{idx} text=\"init\" font-desc=\"Sans 10\" halignment=left valignment=top xpad=20 ypad=20 shaded-background=false color=0xFF00FF00 ! "
+        " queue leaky=2 max-size-buffers=2 max-size-bytes=0 max-size-time=0 ! "
     )
+
+def on_client_connected(server, client):
+    # Print a message with the current date and time when a client connects    
+    now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    print(f"[{now}] A client has connected: {client}")
 
 def main():
     parser = argparse.ArgumentParser(description="Dual Basler RTSP with PFS + forced format")
@@ -54,7 +62,7 @@ def main():
         "("
         + cam0 + cam1 +
         # 合成 → I420（CPU mem）→ NVMM/NV12 → 硬編 → parse → pay0
-        f" compositor name=c sink_0::xpos=0 sink_1::xpos={args.side_w} ! "
+        f" compositor name=c sync=false ignore-inactive-pads=true sink_0::xpos=0 sink_1::xpos={args.side_w} ! "
         f" video/x-raw,format=I420,width={total_w},height={total_h},framerate={fps}/1 ! "
         " queue leaky=2 max-size-buffers=0 max-size-bytes=0 max-size-time=0 ! "
         f" nvvidconv ! video/x-raw(memory:NVMM),format=NV12,width={total_w},height={total_h},framerate={fps}/1 ! "
@@ -68,8 +76,36 @@ def main():
     )
 
     server = GstRtspServer.RTSPServer(); server.set_service(args.port)
+    server.connect("client-connected", on_client_connected)
     factory = GstRtspServer.RTSPMediaFactory()
     factory.set_launch(launch); factory.set_shared(True)
+    
+    def on_media_configure(factory, media):
+        # Periodically update overlay text; re-fetch overlays each time in case the bin isn't ready yet
+        def update_text():
+            try:
+                element = media.get_element()
+            except Exception:
+                return True
+            ov0 = element.get_by_name("ov0") if element else None
+            ov1 = element.get_by_name("ov1") if element else None
+            ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")
+            if ov0:
+                try:
+                    ov0.set_property("text", ts)
+                except Exception:
+                    pass
+            if ov1:
+                try:
+                    ov1.set_property("text", ts)
+                except Exception:
+                    pass
+            return True  # keep timer
+
+        # Update ~every 50ms for fresh microseconds without excessive load
+        GLib.timeout_add(50, update_text)
+
+    factory.connect("media-configure", on_media_configure)
     try:
         from gi.repository import GstRtspServer as R
         factory.set_suspend_mode(R.RTSPSuspendMode.NONE)

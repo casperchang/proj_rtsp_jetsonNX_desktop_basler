@@ -1,0 +1,7 @@
+[project]
+name = "rtsp-dual-recorder"
+version = "0.1.0"
+requires-python = ">=3.10"
+dependencies = []
+# opencv provided by system package (python3-opencv) for GStreamer support
+# sudo apt install python3-opencv
