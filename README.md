@@ -35,17 +35,50 @@ with live GUI preview and per-camera MP4 recording.
 
 ```
 ├── rtsp_server_jetson_device/
-│   ├── mini_rtsp_dualcam_pfs.py        # Main RTSP server script
-│   ├── camera1_config_gray.pfs         # Basler PFS config — cam0, grayscale
-│   ├── camera2_config_gray.pfs         # Basler PFS config — cam1, grayscale
-│   ├── camera1_config_color.pfs        # Basler PFS config — cam0, color
-│   ├── camera2_config_color.pfs        # Basler PFS config — cam1, color
-│   └── requirements.txt               # Server-side Python dependencies
+│   │
+│   │   # --- Main script ---
+│   ├── mini_rtsp_dualcam_pfs.py          # Current working dual-camera RTSP server
+│   │
+│   │   # --- Historical / reference variants ---
+│   ├── mini_rtsp_dualcam_launch.py       # Earliest launch version — baseline reference
+│   ├── mini_rtsp_dualcam_launch_60fps.py # Hardcoded 60fps variant
+│   ├── mini_rtsp_dualcam_launch_v3.py    # Crash-hardened: set_reusable, num-extra-surfaces
+│   ├── mini_rtsp_onecam.py               # Single-camera RTSP server (/cam0)
+│   ├── mini_rtsp_onecam_launch.py        # Single-camera launch wrapper
+│   │
+│   │   # --- Diagnostic tools ---
+│   ├── rtsp_streamer.py                  # Tests each GStreamer element individually — debug missing plugins
+│   ├── rtsp_test.py                      # Pipeline test using videotestsrc (no camera needed)
+│   │
+│   │   # --- Local camera utilities (no RTSP) ---
+│   ├── dual_preview.py                   # Live side-by-side OpenCV preview
+│   ├── dual_record.py                    # Local dual-camera recording (no RTSP)
+│   │
+│   │   # --- Flask / MJPEG alternative streaming ---
+│   ├── streaming/
+│   │   ├── camera.py                     # pypylon + Flask MJPEG streaming server
+│   │   ├── main.py                       # Flask app entry point
+│   │   ├── router.py                     # Flask routes
+│   │   └── camera_setting.yaml          # Exposure/gain config for Flask streamer
+│   │
+│   │   # --- Camera PFS configuration files ---
+│   ├── camera1_config_gray.pfs           # Basler PFS — cam0, grayscale
+│   ├── camera2_config_gray.pfs           # Basler PFS — cam1, grayscale
+│   ├── camera1_config_color.pfs          # Basler PFS — cam0, color
+│   ├── camera2_config_color.pfs          # Basler PFS — cam1, color
+│   ├── color.pfs                         # PFS for daA1920-160uc color model
+│   │
+│   │   # --- Camera serial number profiles ---
+│   ├── camera_profiles/
+│   │   ├── camera_features_40535833.txt  # Full feature dump — SN 40535833 (daA1920-160uc)
+│   │   └── camera_features_40535835.txt  # Full feature dump — SN 40535835
+│   │
+│   └── requirements.txt                  # Minimal server dependencies
 │
 └── rtsp_client_desktop/
-    ├── rtsp_dual_recorder.py           # Main client script (preview + record)
-    ├── pyproject.toml                  # uv project config
-    └── rtsp_preview_and_record.py      # Older single-file client (reference)
+    ├── rtsp_dual_recorder.py             # Current working client (GUI preview + record)
+    ├── pyproject.toml                    # uv project config
+    └── rtsp_preview_and_record.py        # Older single-file client (reference)
 ```
 
 ---
@@ -54,7 +87,12 @@ with live GUI preview and per-camera MP4 recording.
 
 ### Server — Jetson Orin NX
 
-> **Hardware:** Jetson Orin NX, two Basler cameras via USB/GigE, GStreamer with Jetson multimedia plugins.
+> **Hardware:** Jetson Orin NX, two Basler cameras, GStreamer with Jetson multimedia plugins (`nvvidconv`, `nvv4l2h264enc`).
+>
+> **Dependencies:**
+> ```bash
+> pip install -r requirements.txt
+> ```
 
 ```bash
 cd /home/casper/Dual_Camera
@@ -115,11 +153,15 @@ uv run python rtsp_dual_recorder.py --url rtsp://192.168.0.151:8554/dualcam
 
 | Key | Action |
 |-----|--------|
-| `r` | Start recording |
+| `r` | Start recording — saves `cam0_<ts>.mp4` and `cam1_<ts>.mp4` to `--output_dir` |
 | `s` | Stop recording |
-| `q` / ESC | Quit |
+| `q` / ESC | Quit (stops any active recording first) |
 
-Recordings are saved as `cam0_<timestamp>.mp4` and `cam1_<timestamp>.mp4` in `--output_dir`.
+**GUI overlay:**
+- Top-left: `[LIVE]` (grey) or `[REC]` (green) status tag
+- Bottom-left: rolling 30-frame FPS counter
+- Bottom-left (while recording): elapsed recording time `REC MM:SS`
+- Red vertical line at horizontal midpoint marking the cam0/cam1 split
 
 ---
 
@@ -137,6 +179,16 @@ case `vah264dec` is used automatically and delivers ~60 fps on Intel integrated 
 
 ---
 
+## Diagnostic Tools (server-side)
+
+**`rtsp_test.py`** — test the full GStreamer/RTSP pipeline without any cameras attached.
+Uses `videotestsrc` in place of `pylonsrc`. Run this first when setting up a new machine.
+
+**`rtsp_streamer.py`** — builds the pipeline element by element and reports exactly which
+plugin fails to load. Use this when `gst-inspect-1.0` passes but the pipeline refuses to start.
+
+---
+
 ## Known Issues & Fixes Applied
 
 ### Stream lag and camera freeze (server-side)
@@ -145,6 +197,6 @@ case `vah264dec` is used automatically and delivers ~60 fps on Intel integrated 
 **Fix:** `compositor sync=false` + pre-compositor queues capped at `max-size-buffers=2 leaky=downstream`.
 
 ### Stripe artifact in recorded files (client-side)
-**Symptom:** Recorded MP4 shows horizontal stripes; GUI preview is fine.  
-**Cause:** `frame[:, :side_w]` is a non-contiguous numpy view; GStreamer `appsrc` reads raw bytes ignoring stride.  
+**Symptom:** Recorded MP4 shows horizontal stripes; GUI preview is correct.  
+**Cause:** `frame[:, :side_w]` is a non-contiguous numpy view; GStreamer `appsrc` reads raw bytes ignoring stride, interleaving rows from both camera halves.  
 **Fix:** `.copy()` called on each half before passing to `VideoWriter.write()`.
