@@ -11,13 +11,12 @@ uv.lock
 # Recordings / videos
 *.mp4
 *.avi
+videos/
+identify_photos/
 
 # Logs & data
 *.csv
 *.log
-
-# Camera feature dumps
-camera_features*.txt
 
 # Temp / message files
 MESSAGE_FOR_SERVER.md

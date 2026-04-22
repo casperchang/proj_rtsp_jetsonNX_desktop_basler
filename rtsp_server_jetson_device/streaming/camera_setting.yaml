@@ -1,0 +1,8 @@
+CameraSettings:
+  - Index: 1
+    ExposureTime: 5000
+    Gain: 0.0
+
+  - Index: 2
+    ExposureTime: 5000
+    Gain: 0.0
